@@ -1,11 +1,17 @@
 Name:		scrub
 Version:	2.5.2
-Release:	3%{?dist}
+Release:	7%{?dist}
 Summary:	Disk scrubbing program
 License:	GPLv2+
 Group:		System Environment/Base
 URL:		http://code.google.com/p/diskscrub/
 Source0:	http://diskscrub.googlecode.com/files/%{name}-%{version}.tar.bz2
+
+# Needed for running ./autogen.sh successfully
+BuildRequires: automake autoconf libtool
+
+# 1130138 - [RFE] Add option for "scrub" utility to only scrub used blocks of a sparse file
+Patch0: scrub-2.5.2-extentonly.patch
 
 %description
 Scrub writes patterns on files or disk devices to make
@@ -18,8 +24,10 @@ the file system is full, then scrubbed as in 2).
 
 %prep
 %setup -q
+%patch0 -p1
 
 %build
+./autogen.sh
 %configure
 make %{?_smp_mflags}
 
@@ -33,6 +41,16 @@ make DESTDIR=%{buildroot} install
 %{_mandir}/man1/scrub.1*
 
 %changelog
+* Tue Mar 28 2017 Daniel Kopecek <dkopecek@redhat.com> - 2.5.2-7
+- Added option to enable extent-only scrubbing
+  Resolves: rhbz#1130138
+
+* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 2.5.2-5
+- Mass rebuild 2014-01-24
+
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 2.5.2-4
+- Mass rebuild 2013-12-27
+
 * Thu Feb 14 2013 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 2.5.2-3
 - Rebuilt for https://fedoraproject.org/wiki/Fedora_19_Mass_Rebuild
 

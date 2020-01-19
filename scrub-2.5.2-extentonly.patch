@@ -1,0 +1,722 @@
+diff --git a/libscrub/Makefile.am b/libscrub/Makefile.am
+index 477c866..d88cd48 100644
+--- a/libscrub/Makefile.am
++++ b/libscrub/Makefile.am
+@@ -13,6 +13,7 @@ libscrub_la_SOURCES = \
+ 	libscrub.c \
+ 	scrub.h \
+ 	../src/aes.c \
++	../src/fextent_apply.c \
+ 	../src/filldentry.c \
+ 	../src/fillfile.c \
+ 	../src/genrand.c \
+diff --git a/man/scrub.1.in b/man/scrub.1.in
+index a1c260a..72b114f 100644
+--- a/man/scrub.1.in
++++ b/man/scrub.1.in
+@@ -106,6 +106,13 @@ Don't generate random data in parallel with I/O.
+ .TP
+ \fI-h\fR, \fI--help\fR
+ Print a summary of command line options on stderr.
++.TP
++\fI-E\fR, \fI--extent-only\fR
++When scrubbing regular files, scrub only the file extents. This option is
++useful in combination with large sparse files. If used, scrub will skip
++the holes in the sparse file. Use this option with caution, the result may not
++be compliant with cited standards and information about the actual on-disk
++data allocation may leak since only the allocated parts will be scrubbed.
+ .SH SCRUB METHODS
+ .TP
+ .I "nnsa"
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 0cbd8f7..5de0b68 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -3,6 +3,8 @@ bin_PROGRAMS = scrub
+ scrub_SOURCES = \
+ 	aes.c \
+ 	aes.h \
++	fextent_apply.c \
++	fextent_apply.h \
+ 	filldentry.c \
+ 	filldentry.h \
+ 	fillfile.c \
+diff --git a/src/fextent_apply.c b/src/fextent_apply.c
+new file mode 100644
+index 0000000..31d3210
+--- /dev/null
++++ b/src/fextent_apply.c
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2012 Red Hat Inc., Durham, North Carolina.
++ * All Rights Reserved.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful, 
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * Authors:
++ *      Daniel Kopecek <dkopecek@redhat.com>
++ */
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/ioctl.h>
++#include <sys/file.h>
++
++#include <linux/fs.h>
++#include <linux/fiemap.h>
++
++#ifndef NDEBUG
++# define dP(...)				\
++    do { int  __tmp_errno = errno;		\
++	fprintf(stderr, "DEBUG: "__VA_ARGS__);	\
++	errno = __tmp_errno;			\
++    } while(0)
++#else
++# define dP(...) while(0)
++#endif
++
++int fextent_apply(int fd, int (*function)(int, struct fiemap_extent *, void *), void *arg)
++{
++    int ret = -1;
++    struct stat st;
++    struct fiemap *em;
++    uint32_t extent_count, i;
++
++    // lock, sync, stat
++    if (flock(fd, LOCK_EX) != 0) {
++	dP("flock(%d, LOCK_EX) failed: %s, %d.\n", fd, strerror(errno), errno);
++	return -1;
++    }
++    if (fsync(fd) != 0) {
++	dP("fsync(%d) failed: %s, %d.\n", fd, strerror(errno), errno);
++	goto exit_1;
++    }
++    if (fstat(fd, &st) != 0) {
++	dP("fstat(%d) failed: %s, %d.\n", fd, strerror(errno), errno);
++	goto exit_1;
++    }
++    
++    /*
++     * fiemap => get extent count
++     */
++    em = malloc(sizeof(struct fiemap));
++
++    if (em == NULL) {
++	dP("malloc(%zu) returned NULL!\n", sizeof(struct fiemap));
++	goto exit_1;
++    }
++
++    memset(em, 0, sizeof(struct fiemap));
++
++    em->fm_start = 0;
++    em->fm_length = st.st_size;
++    em->fm_extent_count = 0;
++    em->fm_mapped_extents = 0;
++    em->fm_flags = 0;
++
++    if (ioctl(fd, FS_IOC_FIEMAP, em) != 0) {
++	dP("FS_IOC_FIEMAP: %s, %d.\n", strerror(errno), errno);
++	goto exit_0;
++    }
++
++    extent_count = em->fm_mapped_extents;
++    free(em);
++
++    /*
++     * fiemap => get extents
++     */
++    em = malloc (sizeof(struct fiemap)
++		 + (sizeof(struct fiemap_extent) * extent_count));
++
++    if (em == NULL) {
++	dP("malloc(%zu) returned NULL!\n", sizeof(struct fiemap)
++	   + (sizeof (struct fiemap_extent) * extent_count));
++	goto exit_0;
++    }
++
++    memset(em, 0, sizeof(struct fiemap)
++	   + (sizeof(struct fiemap_extent) * extent_count));
++
++    em[0].fm_start = 0;
++    em[0].fm_length = st.st_size;
++    em[0].fm_extent_count = extent_count;
++    em[0].fm_flags = 0;
++
++    if (ioctl(fd, FS_IOC_FIEMAP, em) != 0) {
++	dP("FS_IOC_FIEMAP: %s, %d.\n", strerror(errno), errno);
++	goto exit_0;
++    }
++   
++    for (i = 0; i < extent_count; ++i) {
++	// seek to extent start
++	if (lseek(fd, em->fm_extents[i].fe_logical, SEEK_SET) == (off_t)-1) {
++	    dP("lseek(%d, %llu, SET) failed: %s, %d.\n",
++	       fd, em->fm_extents[i].fe_logical, strerror(errno), errno);
++	    goto exit_0;
++	}
++
++	ret = function(fd, em->fm_extents + i, arg);
++	if (ret != 0)
++	    goto exit_0;
++    }
++
++    ret = 0;
++  exit_0:
++    // release resources
++    free (em);
++  exit_1:
++    // unlock
++    if (flock(fd, LOCK_UN) != 0)
++	ret = -1;
++
++    return ret;
++}
+diff --git a/src/fextent_apply.h b/src/fextent_apply.h
+new file mode 100644
+index 0000000..40a54ec
+--- /dev/null
++++ b/src/fextent_apply.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2012 Red Hat Inc., Durham, North Carolina.
++ * All Rights Reserved.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful, 
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * Authors:
++ *      Daniel Kopecek <dkopecek@redhat.com>
++ */
++#ifndef FEXTENT_APPLY_H
++#define FEXTENT_APPLY_H
++
++#include <linux/fs.h>
++#include <linux/fiemap.h>
++
++int fextent_apply(int fd, int (*function)(int, struct fiemap_extent *, void *), void *arg);
++
++#endif /* FEXTENT_APPLY_H */
+diff --git a/src/fillfile.c b/src/fillfile.c
+index e0f67b6..a77367f 100644
+--- a/src/fillfile.c
++++ b/src/fillfile.c
+@@ -42,6 +42,7 @@
+ 
+ #include "util.h"
+ #include "fillfile.h"
++#include "fextent_apply.h"
+ 
+ static int no_threads = 0;
+ 
+@@ -57,6 +58,20 @@ struct memstruct {
+ 
+ extern char *prog;
+ 
++struct fillfile_args {
++    char *path;
++    off_t filesize;
++    unsigned char *mem;
++    int memsize;
++    progress_t progress;
++    void *arg;
++    refill_t refill;
++    unsigned char *buf;
++};
++
++int fillextent(int fd, struct fiemap_extent *extent, void *pa);
++int checkextent(int fd, struct fiemap_extent *extent, void *pa);
++
+ #if defined(O_DIRECT) && (defined(HAVE_POSIX_MEMALIGN) || defined(HAVE_MEMALIGN))
+ # define MY_O_DIRECT O_DIRECT
+ #else
+@@ -155,11 +170,12 @@ refill_fini(struct memstruct *mp)
+  * If 'sparse' is true, only scrub first and last blocks (for testing).
+  * The number of bytes written is returned.
+  * If 'creat' is true, open with O_CREAT and allow ENOSPC to be non-fatal.
++ * IF 'extentonly' is true, fill only file extents with the given pattern
+  */
+ off_t
+ fillfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+          progress_t progress, void *arg, refill_t refill, 
+-         bool sparse, bool creat)
++         bool sparse, bool creat, bool extentonly)
+ {
+     int fd = -1;
+     off_t n;
+@@ -179,34 +195,58 @@ fillfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+     }
+     if (fd < 0)
+         goto error;
+-    do {
+-        if (written + memsize > filesize)
+-            memsize = filesize - written;
+-        if (refill && !sparse) {
+-            if (!mp)
+-                if (refill_init(&mp, refill, memsize) < 0)
+-                    goto error;
+-            if (refill_memcpy(mp, mem, memsize, filesize, written) < 0)
+-                goto error;
+-        }
+-        if (sparse && !(written == 0) && !(written + memsize == filesize)) {
+-            if (lseek(fd, memsize, SEEK_CUR) < 0)
+-                goto error;
+-            written += memsize;
+-        } else {
+-            n = write_all(fd, mem, memsize);
+-            if (creat && n < 0 && errno == ENOSPC)
+-                break;
+-            if (n == 0) {
+-                errno = EINVAL; /* write past end of device? */
+-                goto error;
+-            } else if (n < 0)
+-                goto error;
+-            written += n;
++
++    if (extentonly) {
++        struct fillfile_args fa;
++
++        fa.path = path;
++        fa.filesize = filesize;
++        fa.mem = mem;
++        fa.memsize = memsize;
++        fa.progress = progress;
++        fa.refill = refill;
++        fa.arg = arg;
++
++        if (fextent_apply(fd, fillextent, &fa) == 0) {
++            written = filesize;
+         }
+-        if (progress)
+-            progress(arg, (double)written/filesize);
+-    } while (written < filesize);
++    } else {
++        do {
++            if (written + memsize > filesize)
++                memsize = filesize - written;
++            if (refill && !sparse) {
++                if (!mp) {
++                    if (refill_init(&mp, refill, memsize) < 0) {
++                        goto error;
++                    }
++                }
++                if (refill_memcpy(mp, mem, memsize, filesize, written) < 0) {
++                    goto error;
++                }
++            }
++            if (sparse && !(written == 0) && !(written + memsize == filesize)) {
++                if (lseek(fd, memsize, SEEK_CUR) < 0) {
++                    goto error;
++                }
++                written += memsize;
++            } else {
++                n = write_all(fd, mem, memsize);
++                if (creat && n < 0 && errno == ENOSPC)
++                    break;
++                if (n == 0) {
++                    errno = EINVAL;
++                    goto error;
++                }
++                else if (n < 0) {
++                    goto error;
++                }
++                written += n;
++            }
++            if (progress)
++                progress(arg, (double)written/filesize);
++        } while (written < filesize);
++    }
++
+     if (fsync(fd) < 0)
+         goto error;
+ #if defined(HAVE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
+@@ -230,7 +270,7 @@ error:
+  */
+ off_t
+ checkfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+-          progress_t progress, void *arg, bool sparse)
++          progress_t progress, void *arg, bool sparse, bool extentonly)
+ {
+     int fd = -1;
+     off_t n;
+@@ -238,8 +278,6 @@ checkfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+     unsigned char *buf = NULL;
+     int openflags = O_RDONLY;
+ 
+-    if (!(buf = alloc_buffer(memsize)))
+-        goto nomem;
+     if (filetype(path) != FILE_CHAR)
+         openflags |= MY_O_DIRECT;
+     fd = open(path, openflags);
+@@ -250,32 +288,60 @@ checkfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+     }
+     if (fd < 0)
+         goto error;
+-    do {
+-        if (verified + memsize > filesize)
+-            memsize = filesize - verified;
+-        if (sparse && !(verified == 0) && !(verified + memsize == filesize)) {
+-            if (lseek(fd, memsize, SEEK_CUR) < 0)
+-                goto error;
+-            verified += memsize;
+-        } else {
+-            n = read_all(fd, buf, memsize);
+-            if (n < 0)
+-                goto error;
+-            if (n == 0) {
+-                errno = EINVAL; /* early EOF */
+-                goto error;
+-            }
+-            if (memcmp(mem, buf, memsize) != 0) {
+-                break; /* return < filesize means verification failure */
+-            }
+-            verified += n;
++    if (extentonly) {
++        struct fillfile_args fa;
++
++        fa.path = path;
++        fa.filesize = filesize;
++        fa.mem = mem;
++        fa.memsize = memsize;
++        fa.progress = progress;
++        fa.arg = arg;
++        fa.buf = alloc_buffer(memsize);
++
++        if (fa.buf == NULL) {
++            goto nomem;
+         }
+-        if (progress)
+-            progress(arg, (double)verified/filesize);
+-    } while (verified < filesize);
++
++        if (fextent_apply(fd, checkextent, &fa) == 0)
++            verified = filesize;
++
++        free(fa.buf);
++    } else {
++        if (!(buf = alloc_buffer(memsize)))
++            goto nomem;
++        do {
++            if (verified + memsize > filesize)
++                memsize = filesize - verified;
++            if (sparse && !(verified == 0) && !(verified + memsize == filesize)) {
++                if (lseek(fd, memsize, SEEK_CUR) < 0) {
++                    goto error;
++                }
++                verified += memsize;
++            } else {
++                n = read_all(fd, buf, memsize);
++                if (n < 0) {
++                    goto error;
++                }
++                if (n == 0) {
++                    errno = EINVAL; /* early EOF */
++                    goto error;
++                }
++                if (memcmp(mem, buf, memsize) != 0) {
++                    break;
++                }
++                verified += n;
++            }
++            if (progress)
++                progress(arg, (double)verified/filesize);
++        } while (verified < filesize);
++    }
++ 
+     if (close(fd) < 0)
+         goto error;
+-    free(buf);
++    if (buf != NULL) {
++        free(buf);
++    }
+     return verified;
+ nomem:
+     errno = ENOMEM;
+@@ -293,6 +359,63 @@ disable_threads(void)
+     no_threads = 1;
+ }
+ 
++int fillextent(int fd, struct fiemap_extent *extent, void *pa)
++{
++    off_t n;
++    off_t written = 0LL;
++    struct fillfile_args args = *(struct fillfile_args *)(pa);
++    
++    do {
++        if (args.refill)
++            args.refill(args.mem, args.memsize);
++
++        if (written + args.memsize > extent->fe_length)
++            args.memsize = extent->fe_length - written;
++
++        n = write_all(fd, args.mem, args.memsize);
++
++        if (n < 0) {
++            fprintf(stderr, "%s: write %s: %s\n", prog, args.path, strerror(errno));
++            exit(1);
++        }
++        written += n;
++
++        if (args.progress)
++            args.progress(args.arg, (double)(extent->fe_logical + written)/args.filesize);
++    } while (written < extent->fe_length);
++
++    return 0;
++}
++
++int checkextent(int fd, struct fiemap_extent *extent, void *pa)
++{
++    off_t n;
++    off_t verified = 0LL;
++    struct fillfile_args args = *(struct fillfile_args *)(pa);
++
++    do {
++        if (verified + args.memsize > extent->fe_length)
++            args.memsize = extent->fe_length - verified;
++
++        n = read_all(fd, args.buf, args.memsize);
++        if (n < 0) {
++            return -1;
++        }
++        if (n == 0) {
++            errno = EINVAL;
++            return -1;
++        }
++        if (memcmp(args.mem, args.buf, args.memsize) != 0) {
++            break;
++        }
++        verified += n;
++        if (args.progress)
++            args.progress(args.arg, (double)(extent->fe_logical+verified)/args.filesize);
++    } while (verified < extent->fe_length);
++
++    return 0;
++}
++
+ /*
+  * vi:tabstop=4 shiftwidth=4 expandtab
+  */
+diff --git a/src/fillfile.h b/src/fillfile.h
+index b9ef951..2fc917d 100644
+--- a/src/fillfile.h
++++ b/src/fillfile.h
+@@ -29,7 +29,7 @@ typedef void (*refill_t) (unsigned char *mem, int memsize);
+ 
+ off_t fillfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+         progress_t progress, void *arg, refill_t refill, 
+-        bool sparse, bool creat);
++        bool sparse, bool creat, bool extentonly);
+ off_t checkfile(char *path, off_t filesize, unsigned char *mem, int memsize,
+-        progress_t progress, void *arg, bool sparse);
++        progress_t progress, void *arg, bool sparse, bool extentonly);
+ void  disable_threads(void);
+diff --git a/src/genrand.c b/src/genrand.c
+index 820c898..ecfd382 100644
+--- a/src/genrand.c
++++ b/src/genrand.c
+@@ -106,7 +106,7 @@ genrandraw(unsigned char *buf, int buflen)
+                 buf[n] = result;
+             }
+ #endif
+-            return;
++            return 0;
+         }
+     }
+ 
+diff --git a/src/scrub.c b/src/scrub.c
+index dec71f3..b0eb1f7 100644
+--- a/src/scrub.c
++++ b/src/scrub.c
+@@ -58,12 +58,12 @@
+ #define BUFSIZE (4*1024*1024) /* default blocksize */
+ 
+ static bool       scrub(char *path, off_t size, const sequence_t *seq,
+-                      int bufsize, bool Sopt, bool sparse, bool enospc);
++                      int bufsize, bool Sopt, bool sparse, bool enospc, bool extentonly);
+ static void       scrub_free(char *path, off_t size, const sequence_t *seq,
+                       int bufsize, bool Sopt);
+ static void       scrub_dirent(char *path, char *newpath);
+ static void       scrub_file(char *path, off_t size, const sequence_t *seq,
+-                      int bufsize, bool Sopt, bool sparse);
++                      int bufsize, bool Sopt, bool sparse, bool extentonly);
+ #if __APPLE__
+ static void       scrub_resfork(char *path, const sequence_t *seq,
+                       int bufsize);
+@@ -71,7 +71,7 @@ static void       scrub_resfork(char *path, const sequence_t *seq,
+ static void       scrub_disk(char *path, off_t size, const sequence_t *seq,
+                       int bufsize, bool Sopt, bool sparse);
+ 
+-#define OPTIONS "p:D:Xb:s:fSrvTLRth"
++#define OPTIONS "p:D:Xb:s:fSrvTELRth"
+ #if HAVE_GETOPT_LONG
+ #define GETOPT(ac,av,opt,lopt) getopt_long(ac,av,opt,lopt,NULL)
+ static struct option longopts[] = {
+@@ -85,6 +85,7 @@ static struct option longopts[] = {
+     {"remove",           no_argument,        0, 'r'},
+     {"version",          no_argument,        0, 'v'},
+     {"test-sparse",      no_argument,        0, 'T'},
++    {"extent-only",      no_argument,        0, 'E'},
+     {"no-link",          no_argument,        0, 'L'},
+     {"no-hwrand",        no_argument,        0, 'R'},
+     {"no-threads",       no_argument,        0, 't'},
+@@ -111,6 +112,7 @@ usage(void)
+ "  -f, --force             scrub despite signature from previous scrub\n"
+ "  -S, --no-signature      do not write scrub signature after scrub\n"
+ "  -r, --remove            remove file after scrub\n"
++"  -E, --extent-only       scrub only file extents\n"
+ "  -L, --no-link           do not scrub link target\n"
+ "  -R, --no-hwrand         do not use a hardware random number generator\n"
+ "  -t, --no-threads        do not compute random data in a parallel thread\n"
+@@ -139,6 +141,7 @@ main(int argc, char *argv[])
+     bool Lopt = false;
+     bool Ropt = false;
+     bool topt = false;
++    bool Eopt = false;
+     extern int optind;
+     extern char *optarg;
+     int c;
+@@ -207,6 +210,9 @@ main(int argc, char *argv[])
+         case 'T':   /* --test-sparse */
+             Topt = true;
+             break;
++        case 'E':   /* --extent-only */
++            Eopt = true;
++            break;
+         case 'L':   /* --no-link */
+             Lopt = true;
+             break;
+@@ -315,7 +321,7 @@ main(int argc, char *argv[])
+                         prog, Dopt, filename);
+                 exit(1);
+             }
+-            scrub_file(filename, sopt, seq, bopt, Sopt, Topt);
++            scrub_file(filename, sopt, seq, bopt, Sopt, Topt, Eopt);
+ #if __APPLE__
+             scrub_resfork(filename, seq, bopt);
+ #endif
+@@ -346,14 +352,14 @@ done:
+  */
+ static bool
+ scrub(char *path, off_t size, const sequence_t *seq, int bufsize, 
+-      bool Sopt, bool sparse, bool enospc)
++      bool Sopt, bool sparse, bool enospc, bool extentonly)
+ {
+     unsigned char *buf;
+     int i;
+     prog_t p;
+     char sizestr[80];
+     bool isfull = false;
+-    off_t written, checked;
++    off_t written = (off_t)-1, checked = (off_t)-1;
+ 
+     if (!(buf = alloc_buffer(bufsize))) {
+         fprintf(stderr, "%s: out of memory\n", prog);
+@@ -381,7 +387,7 @@ scrub(char *path, off_t size, const sequence_t *seq, int bufsize,
+                 }
+                 written = fillfile(path, size, buf, bufsize, 
+                                    (progress_t)progress_update, p, 
+-                                   (refill_t)genrand, sparse, enospc);
++                                   (refill_t)genrand, sparse, enospc, extentonly);
+                 if (written == (off_t)-1) {
+                     fprintf(stderr, "%s: %s: %s\n", prog, path,
+                              strerror(errno));
+@@ -395,7 +401,7 @@ scrub(char *path, off_t size, const sequence_t *seq, int bufsize,
+                 memset_pat(buf, seq->pat[i], bufsize);
+                 written = fillfile(path, size, buf, bufsize, 
+                                    (progress_t)progress_update, p, 
+-                                   NULL, sparse, enospc);
++                                   NULL, sparse, enospc, extentonly);
+                 if (written == (off_t)-1) {
+                     fprintf(stderr, "%s: %s: %s\n", prog, path,
+                              strerror(errno));
+@@ -409,7 +415,7 @@ scrub(char *path, off_t size, const sequence_t *seq, int bufsize,
+                 memset_pat(buf, seq->pat[i], bufsize);
+                 written = fillfile(path, size, buf, bufsize, 
+                                    (progress_t)progress_update, p, 
+-                                   NULL, sparse, enospc);
++                                   NULL, sparse, enospc, extentonly);
+                 if (written == (off_t)-1) {
+                     fprintf(stderr, "%s: %s: %s\n", prog, path,
+                              strerror(errno));
+@@ -419,7 +425,7 @@ scrub(char *path, off_t size, const sequence_t *seq, int bufsize,
+                 printf("%s: %-8s", prog, "verify");
+                 progress_create(&p, 50);
+                 checked = checkfile(path, written, buf, bufsize, 
+-                                    (progress_t)progress_update, p, sparse);
++                                    (progress_t)progress_update, p, sparse, extentonly);
+                 if (checked == (off_t)-1) {
+                     fprintf(stderr, "%s: %s: %s\n", prog, path,
+                              strerror(errno));
+@@ -513,7 +519,7 @@ scrub_free(char *dirpath, off_t size, const sequence_t *seq,
+     size = blkalign(size, sb.st_blksize, DOWN);
+     do {
+         snprintf(path, sizeof(path), "%s/scrub.%.3d", dirpath, fileno++);
+-        isfull = scrub(path, size, seq, bufsize, Sopt, false, true);
++        isfull = scrub(path, size, seq, bufsize, Sopt, false, true, false);
+     } while (!isfull);
+     while (--fileno >= 0) {
+         snprintf(path, sizeof(path), "%s/scrub.%.3d", dirpath, fileno);
+@@ -565,7 +571,7 @@ scrub_dirent(char *path, char *newpath)
+  */
+ static void 
+ scrub_file(char *path, off_t size, const sequence_t *seq, 
+-           int bufsize, bool Sopt, bool sparse)
++           int bufsize, bool Sopt, bool sparse, bool extentonly)
+ {
+     struct stat sb;
+     filetype_t ftype = filetype(path);
+@@ -590,7 +596,7 @@ scrub_file(char *path, off_t size, const sequence_t *seq,
+                     prog, path, (int)(size - sb.st_size)); 
+         }
+     }
+-    scrub(path, size, seq, bufsize, Sopt, sparse, false);
++    scrub(path, size, seq, bufsize, Sopt, sparse, false, extentonly);
+ }
+ 
+ /* Scrub apple resource fork component of file.
+@@ -618,7 +624,7 @@ scrub_resfork(char *path, const sequence_t *seq, int bufsize)
+         printf("%s: padding %s with %d bytes to fill last fs block\n", 
+                         prog, rpath, (int)(rsize - rsb.st_size)); 
+     }
+-    scrub(rpath, rsize, seq, bufsize, false, false, false);
++    scrub(rpath, rsize, seq, bufsize, false, false, false, false);
+ }
+ #endif
+ 
+@@ -639,7 +645,7 @@ scrub_disk(char *path, off_t size, const sequence_t *seq, int bufsize,
+         }
+         printf("%s: please verify that device size below is correct!\n", prog);
+     }
+-    scrub(path, size, seq, bufsize, Sopt, sparse, false);
++    scrub(path, size, seq, bufsize, Sopt, sparse, false, false);
+ }
+ 
+ /*
