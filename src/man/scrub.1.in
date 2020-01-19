@@ -1,0 +1,261 @@
+.TH scrub 1 "@META_DATE@" "@META_ALIAS@" "@META_NAME@"
+.SH NAME
+scrub \- write patterns on disk/file
+.SH SYNOPSIS
+.B scrub
+.I "[OPTIONS] special-file"
+.br
+.B scrub
+.I "[OPTIONS] file"
+.br
+.B scrub
+.I "-X [OPTIONS] directory"
+.SH DESCRIPTION
+.B Scrub
+iteratively writes patterns on files or disk devices
+to make retrieving the data more difficult.  
+.B Scrub 
+operates in one of three modes: 
+.LP
+1) The special file corresponding to an entire disk is scrubbed and
+all data on it is destroyed.  This mode is selected if 
+.I "file"
+is a character or block special file.  This is the most effective method.
+.LP
+2) A regular file is scrubbed and only the data in the file (and optionally
+its name in the directory entry) is destroyed.  
+The file size is rounded up to fill out the last file system block.
+This mode is selected if 
+.I "file"
+is a regular file.  
+See CAVEATS below.
+.LP
+3) 
+.I "directory"
+is created and filled with files until the file system is full, 
+then the files are scrubbed as in 2). This mode is selected with the
+.I "-X" 
+option.  See CAVEATS below.
+.SH OPTIONS
+.B Scrub 
+accepts the following options:
+.TP
+\fI-v\fR, \fI--version\fR
+Print scrub version and exit.
+.TP
+\fI-r\fR, \fI--remove\fR
+Remove the file after scrubbing.
+.TP
+\fI-p\fR, \fI--pattern\fR \fIPATTERN\fR
+Select the patterns to write.  See SCRUB METHODS below.
+The default, \fInnsa\fR, is reasonable for sanitizing modern
+PRML/EPRML encoded disk devices.
+.TP
+\fI-b\fR, \fI--blocksize\fR \fIblocksize\fR
+Perform read(2) and write(2) calls using the specified blocksize (in bytes).  
+.I "K,"
+.I "M,"
+or 
+.I "G"
+may be appended to the number to change the units to
+KiBytes, MiBytes, or GiBytes, respectively.
+Default: 4M.
+.TP
+\fI-f\fR, \fI--force\fR
+Scrub even if target contains signature indicating it has already been
+scrubbed.
+.TP
+\fI-S\fR, \fI--no-signature\fR
+Do not write scrub signature.  Later,
+.B scrub 
+will not be able to ascertain if the disk has already been scrubbed.
+.TP
+\fI-X\fR, \fI--freespace\fR
+Create specified directory and fill it with files until 
+write returns ENOSPC (file system full), then scrub the files as usual.
+The size of each file can be set with \fI-s\fR, otherwise it will be
+the maximum file size creatable given the user's file size limit or 
+1g if unlimited.
+.TP
+\fI-D\fR, \fI--dirent\fR \fInewname\fR
+After scrubbing the file, scrub its name in the directory entry, 
+then rename it to the new name.  
+The scrub patterns used on the directory entry are constrained by the 
+operating system and thus are not compliant with cited standards.
+.TP
+\fI-s\fR, \fI--device-size\fR \fIsize\fR
+Override the device size (in bytes). Without this option,
+.B scrub
+determines media capacity using OS-specific ioctl(2) calls.
+.I "K,"
+.I "M,"
+or 
+.I "G"
+may be appended to the number to change the units to
+KiBytes, MiBytes, or GiBytes, respectively.
+.TP
+\fI-L\fR, \fI--no-link\fR
+If \fIfile\fR is a symbolic link, do not scrub the link target.
+Do remove it, however, if \fI--remove\fR is specified.
+.TP
+\fI-R\fR, \fI--no-hwrand\fR
+Don't use a hardware random number generator even if one is available.
+.TP
+\fI-t\fR, \fI--no-threads\fR
+Don't generate random data in parallel with I/O.
+.TP
+\fI-h\fR, \fI--help\fR
+Print a summary of command line options on stderr.
+.SH SCRUB METHODS
+.TP
+.I "nnsa"
+4-pass NNSA Policy Letter NAP-14.1-C (XVI-8) for sanitizing
+removable and non-removable hard disks, which requires overwriting all
+locations with a pseudorandom pattern twice and then with a known pattern:
+\fBrandom(x2), 0x00, verify\fR.
+.TP
+.I "dod"
+4-pass DoD 5220.22-M section 8-306 procedure (d) for sanitizing removable
+and non-removable rigid disks which requires overwriting all addressable
+locations with a character, its complement, a random character, then verify.
+NOTE: \fBscrub\fR performs the random pass first to make verification
+easier: \fBrandom, 0x00, 0xff, verify\fR.
+.TP
+.I "bsi"
+9-pass method recommended by the German Center of Security in Information
+Technologies (http://www.bsi.bund.de):
+\fB0xff, 0xfe, 0xfd, 0xfb, 0xf7, 0xef, 0xdf, 0xbf, 0x7f\fR.
+.TP
+.I "gutmann"
+The canonical 35-pass sequence described in Gutmann's paper cited below.
+.TP
+.I "schneier"
+7-pass method described by Bruce Schneier in "Applied Cryptography" (1996):
+\fB0x00, 0xff, random(x5)\fR
+.TP
+.I "pfitzner7"
+Roy Pfitzner's 7-random-pass method:
+\fBrandom(x7)\fR.
+.TP
+.I "pfitzner33"
+Roy Pfitzner's 33-random-pass method:
+\fBrandom(x33)\fR.
+.TP
+.I "usarmy"
+US Army AR380-19 method:
+\fB0x00, 0xff, random\fR.
+(Note: identical to DoD 522.22-M section 8-306 procedure (e)
+for sanitizing magnetic core memory).
+.TP
+.I "fillzero"
+1-pass pattern: \fB0x00\fR.
+.TP
+.I "fillff"
+1-pass pattern: \fB0xff\fR.
+.TP
+.I "random"
+1-pass pattern: \fBrandom(x1)\fR.
+.TP
+.I "random2"
+2-pass pattern: \fBrandom(x2)\fR.
+.TP
+.I "old"
+6-pass pre-version 1.7 scrub method:
+\fB0x00, 0xff, 0xaa, 0x00, 0x55, verify\fR.
+.TP
+.I "fastold"
+5-pass pattern:
+\fB0x00, 0xff, 0xaa, 0x55, verify\fR.
+.TP
+.I "custom=string"
+1-pass custom pattern.  String may contain C-style numerical escapes:
+\\nnn (octal) or \\xnn (hex).
+.SH CAVEATS
+.B Scrub 
+may be insufficient to thwart heroic efforts to recover data 
+in an appropriately equipped lab.  If you need this level of
+protection, physical destruction is your best bet.
+.PP
+The effectiveness of scrubbing regular files through a file system
+will be limited by the OS and file system.  File systems that are
+known to be problematic are journaled, log structured, copy-on-write, 
+versioned, and network file systems.  If in doubt, scrub the raw disk device.
+.PP
+Scrubbing free blocks in a file system with the
+.I "-X"
+method is subject to the same caveats as scrubbing regular files,
+and in addition, is only useful to the extent the file system allows 
+you to reallocate the target blocks as data blocks in a new file.
+If in doubt, scrub the raw disk device.
+.PP
+On MacOS X HFS file system,
+.B scrub 
+attempts to overwrite a file's resource fork if it exists.
+Although MacOS X claims it will support additional named forks in the future,
+.B scrub 
+is only aware of the traditional data and resource forks.
+.PP
+.B scrub
+cannot access disk blocks that have been spared out by the disk controller.
+For SATA/PATA drives, the ATA "security erase" command built into the drive
+controller can do this.  Similarly, the ATA "enhanced security erase" can
+erase data on track edges and between tracks.
+The DOS utility HDDERASE from the UCSD Center for Magnetic
+Recording Research can issue these commands, as can modern versions
+of Linux \fBhdparm\fR.
+Unfortunately, the analogous SCSI command is optional according to T-10,
+and not widely implemented.
+.SH EXAMPLES
+To scrub a raw device \fI/dev/sdf1\fR with default NNSA patterns:
+.IP
+.nf
+# scrub /dev/sdf1
+scrub: using NNSA NAP-14.1-C patterns
+scrub: please verify that device size below is correct!
+scrub: scrubbing /dev/sdf1 1995650048 bytes (~1GB)
+scrub: random  |................................................|
+scrub: random  |................................................|
+scrub: 0x00    |................................................|
+scrub: verify  |................................................|
+.fi
+.PP
+To scrub the file \fI/tmp/scrubme\fR with a sequence of 0xff 0xaa bytes:
+.IP
+.nf
+# scrub -p custom="\\xff\\xaa" /tmp/scrubme
+scrub: using Custom single-pass patterns
+scrub: scrubbing /tmp/scrubme 78319616 bytes (~74MB)
+scrub: 0xffaa  |................................................|
+.fi
+.SH AUTHOR
+Jim Garlick <garlick@llnl.gov>
+.LP
+This work was produced at the University of California, 
+Lawrence Livermore National Laboratory under Contract
+No. W-7405-ENG-48 with the DOE.
+Designated UCRL-CODE-2003-006, scrub is licensed under terms of the GNU 
+General Public License.
+.SH SEE ALSO
+DoD 5220.22-M, "National Industrial Security Program Operating Manual", 
+Chapter 8, 01/1995.
+.LP
+NNSA Policy Letter: NAP-14.1-C, "Clearing, Sanitizing, and 
+Destroying Information System Storage Media, Memory Devices, and other 
+Related Hardware", 05-02-08, page XVI-8.
+.LP
+"Secure Deletion of Data from Magnetic and Solid-State Memory", by Peter 
+Gutmann, Sixth USENIX Security Symposium, San Jose, CA, July 22-25, 1996.
+.LP
+"Gutmann Method", Wikipedia, http://en.wikipedia.org/wiki/Gutmann_method.
+.LP
+Darik's boot and Nuke FAQ: 
+http://dban.sourceforge.net/faq/index.html
+.LP
+"Tutorial on Disk Drive Data Sanitization", by Gordon Hugues and Tom Coughlin,
+.br
+http://cmrr.ucsd.edu/people/Hughes/DataSanitizationTutorial.pdf.
+.LP
+"Guidelines for Media Sanitization", NIST special publication 800-88,
+Kissel et al, September, 2006.
+.LP
+shred(1), hdparm(8)
